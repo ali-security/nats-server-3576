@@ -249,6 +249,7 @@ type raft struct {
 	scaleUp      bool // The node is part of a scale up, puts us in observer mode until the log contains data.
 	deleted      bool // If the node was deleted.
 	snapshotting bool // Snapshot is in progress.
+	quorumPaused bool // Pause replication and quorum participation to prevent log growth during slow applies.
 }
 
 type proposedEntry struct {
@@ -320,6 +321,7 @@ type RaftConfig struct {
 var (
 	errNotLeader         = errors.New("raft: not leader")
 	errAlreadyLeader     = errors.New("raft: already leader")
+	errProposalDropped   = errors.New("raft: proposals dropped temporarily")
 	errNilCfg            = errors.New("raft: no config given")
 	errCorruptPeers      = errors.New("raft: corrupt peer state")
 	errEntryLoadFailed   = errors.New("raft: could not load entry from WAL")
@@ -920,6 +922,12 @@ func (n *raft) Propose(data []byte) error {
 	if werr := n.werr; werr != nil {
 		return werr
 	}
+
+	// Drop proposals if requests are overrunning us.
+	if n.dropIncomingProposals() {
+		n.rateLimitFormatWarn("Proposals dropped, over threshold: pindex %d, applied %d, commit %d", n.pindex, n.applied, n.commit)
+		return errProposalDropped
+	}
 	n.prop.push(newProposedEntry(newEntry(EntryNormal, data), _EMPTY_))
 	return nil
 }
@@ -939,10 +947,29 @@ func (n *raft) ProposeMulti(entries []*Entry) error {
 	if werr := n.werr; werr != nil {
 		return werr
 	}
+
+	// Drop proposals if requests are overrunning us.
+	if n.dropIncomingProposals() {
+		n.rateLimitFormatWarn("Proposals dropped, over threshold: pindex %d, applied %d, commit %d", n.pindex, n.applied, n.commit)
+		return errProposalDropped
+	}
 	for _, e := range entries {
 		n.prop.push(newProposedEntry(e, _EMPTY_))
 	}
 	return nil
+}
+
+// dropIncomingProposals returns whether we should drop incoming proposals due to continuously
+// increasing uncommitted or unapplied entries. MUST ONLY be used for external 'normal'
+// proposals, not internal proposals that are required for Raft to function properly.
+// Lock should be held.
+func (n *raft) dropIncomingProposals() bool {
+	// We only do this past a high threshold to protect ourselves.
+	// Either the number of uncommitted entries is over the threshold: we're not getting quorum from our followers.
+	uncommittedThreshold := n.pindex > n.commit && n.pindex-n.commit > pauseQuorumThreshold
+	// Or, the number of in-memory committed but not yet applied entries is over the threshold: we're slow to apply.
+	unappliedThreshold := n.commit > n.applied && n.commit-n.applied > pauseQuorumThreshold
+	return uncommittedThreshold || unappliedThreshold
 }
 
 // ForwardProposal will forward the proposal to the leader if known.
@@ -2393,6 +2420,11 @@ func (n *raft) debug(format string, args ...any) {
 func (n *raft) warn(format string, args ...any) {
 	nf := fmt.Sprintf("RAFT [%s - %s] %s", n.id, n.group, format)
 	n.s.RateLimitWarnf(nf, args...)
+}
+
+func (n *raft) rateLimitFormatWarn(format string, args ...any) {
+	nf := fmt.Sprintf("RAFT [%s - %s] %s", n.id, n.group, format)
+	n.s.rateLimitFormatWarnf(nf, args...)
 }
 
 func (n *raft) error(format string, args ...any) {
@@ -4043,6 +4075,34 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 		}
 	}
 
+	// If commits are outpacing our applies, temporarily stop accepting new entries to avoid falling further behind.
+	// This encourages the leader to sync us via a snapshot instead. We use max(applied, papplied) to avoid
+	// incorrectly triggering this pause immediately after receiving a snapshot.
+	applied := max(n.applied, n.papplied)
+	if n.commit > applied || n.quorumPaused {
+		diff := n.commit - applied
+		if n.quorumPaused {
+			if diff > paeWarnThreshold {
+				n.Unlock()
+				return
+			}
+			// Once we're sufficiently below the threshold, we continue again. We'll likely receive a snapshot
+			// from the leader.
+			n.quorumPaused = false
+			var state StreamState
+			n.wal.FastState(&state)
+			n.warn("Quorum resumed: commit %d, applied %d, WAL size %s", n.commit, applied, friendlyBytes(state.Bytes))
+		} else if diff > pauseQuorumThreshold {
+			// It takes a while until we reach the pause threshold, but once we do we enter a "cooldown period".
+			n.quorumPaused = true
+			var state StreamState
+			n.wal.FastState(&state)
+			n.warn("Quorum paused, falling behind: commit %d != applied %d, WAL size %s", n.commit, applied, friendlyBytes(state.Bytes))
+			n.Unlock()
+			return
+		}
+	}
+
 	if ae.pterm != n.pterm || ae.pindex != n.pindex {
 		// Check if this is a lower or equal index than what we were expecting.
 		if ae.pindex <= n.pindex {
@@ -4421,9 +4481,10 @@ func (n *raft) storeToWAL(ae *appendEntry) error {
 }
 
 const (
-	paeDropThreshold = 20_000
-	paeWarnThreshold = 10_000
-	paeWarnModulo    = 5_000
+	pauseQuorumThreshold = 100_000
+	paeDropThreshold     = 20_000
+	paeWarnThreshold     = 10_000
+	paeWarnModulo        = 5_000
 )
 
 func (n *raft) sendAppendEntry(entries []*Entry) {
