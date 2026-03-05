@@ -4066,6 +4066,215 @@ func TestWSWithPartialWrite(t *testing.T) {
 	}
 }
 
+func testWSNoCorruptionWithFrameSizeLimit(t *testing.T, total int) {
+	tmpl := `
+               listen: "127.0.0.1:-1"
+               cluster {
+                       name: "local"
+                       port: -1
+                       %s
+               }
+               websocket {
+                       listen: "127.0.0.1:-1"
+                       no_tls: true
+               }
+       `
+	conf1 := createConfFile(t, []byte(fmt.Sprintf(tmpl, _EMPTY_)))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+
+	routes := fmt.Sprintf("routes: [\"nats://127.0.0.1:%d\"]", o1.Cluster.Port)
+	conf2 := createConfFile(t, []byte(fmt.Sprintf(tmpl, routes)))
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	conf3 := createConfFile(t, []byte(fmt.Sprintf(tmpl, routes)))
+	s3, _ := RunServerWithConfig(conf3)
+	defer s3.Shutdown()
+
+	checkClusterFormed(t, s1, s2, s3)
+
+	nc3 := natsConnect(t, s3.WebsocketURL())
+	defer nc3.Close()
+
+	nc2 := natsConnect(t, s2.WebsocketURL())
+	defer nc2.Close()
+
+	payload := make([]byte, 2*wsFrameSizeForBrowsers+123)
+	for i := 0; i < len(payload); i++ {
+		payload[i] = 'A' + byte(i%26)
+	}
+	errCh := make(chan error, 1)
+	doneCh := make(chan struct{}, 1)
+	count := int32(0)
+
+	createSub := func(nc *nats.Conn) {
+		sub := natsSub(t, nc, "foo", func(m *nats.Msg) {
+			if !bytes.Equal(m.Data, payload) {
+				stop := len(m.Data)
+				if l := len(payload); l < stop {
+					stop = l
+				}
+				start := 0
+				for i := 0; i < stop; i++ {
+					if m.Data[i] != payload[i] {
+						start = i
+						break
+					}
+				}
+				if stop-start > 20 {
+					stop = start + 20
+				}
+				select {
+				case errCh <- fmt.Errorf("Invalid message: [%d bytes same]%s[...]", start, m.Data[start:stop]):
+				default:
+				}
+				return
+			}
+			if n := atomic.AddInt32(&count, 1); int(n) == 2*total {
+				doneCh <- struct{}{}
+			}
+		})
+		sub.SetPendingLimits(-1, -1)
+	}
+	createSub(nc2)
+	createSub(nc3)
+
+	checkSubInterest(t, s1, globalAccountName, "foo", time.Second)
+
+	nc1 := natsConnect(t, s1.WebsocketURL())
+	defer nc1.Close()
+	natsFlush(t, nc1)
+
+	// Change websocket connections to force a max frame size.
+	for _, s := range []*Server{s1, s2, s3} {
+		s.mu.RLock()
+		for _, c := range s.clients {
+			c.mu.Lock()
+			if c.ws != nil {
+				c.ws.browser = true
+			}
+			c.mu.Unlock()
+		}
+		s.mu.RUnlock()
+	}
+
+	for i := 0; i < total; i++ {
+		natsPub(t, nc1, "foo", payload)
+		if i%100 == 0 {
+			select {
+			case err := <-errCh:
+				t.Fatalf("Error: %v", err)
+			default:
+			}
+		}
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("Error: %v", err)
+	case <-doneCh:
+		return
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Test timed out")
+	}
+}
+
+func TestWSNoCorruptionWithFrameSizeLimit(t *testing.T) {
+	testWSNoCorruptionWithFrameSizeLimit(t, 1000)
+}
+
+func TestWSDecompressLimit(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mpayCfg string
+	}{
+		{"not explicitly configured", _EMPTY_},
+		{"explicit high", "max_payload: 2097152"},
+		{"explicit low", "max_payload: 4096"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conf := createConfFile(t, fmt.Appendf(nil, `
+				listen: "127.0.0.1:-1"
+				websocket {
+					listen: "127.0.0.1:-1"
+					no_tls: true
+				}
+				%s
+			`, test.mpayCfg))
+			s, o := RunServerWithConfig(conf)
+			defer s.Shutdown()
+
+			l := &captureErrorLogger{errCh: make(chan string, 10)}
+			s.SetLogger(l, false, false)
+
+			// Create a client that will use compression.
+			wsc, br, _ := testNewWSClient(t, testWSClientOptions{
+				compress: true,
+				host:     o.Websocket.Host,
+				port:     o.Websocket.Port,
+				noTLS:    true,
+			})
+			// We will hand-craft a frame that would use a 10MB of uncompressed zeros
+			// that should compress really small.
+			buf := &bytes.Buffer{}
+			compressor, _ := flate.NewWriter(buf, 1)
+			chunk := make([]byte, 1024*1024)
+			// Compress the equivalent of 100MB of data. We do by chunks to limit
+			// memory usage here.
+			for range 100 {
+				compressor.Write(chunk)
+			}
+			compressor.Flush()
+			payload := buf.Bytes()
+			// The last 4 bytes are dropped
+			payload = payload[:len(payload)-4]
+			lenPayload := len(payload)
+			frame := make([]byte, 14+lenPayload)
+			frame[0] = byte(wsBinaryMessage)
+			frame[0] |= wsFinalBit
+			frame[0] |= wsRsv1Bit
+			pos := 1
+			switch {
+			case lenPayload <= 125:
+				frame[pos] = byte(lenPayload) | wsMaskBit
+				pos++
+			case lenPayload < 65536:
+				frame[pos] = 126 | wsMaskBit
+				binary.BigEndian.PutUint16(frame[2:], uint16(lenPayload))
+				pos += 3
+			default:
+				frame[1] = 127 | wsMaskBit
+				binary.BigEndian.PutUint64(frame[2:], uint64(lenPayload))
+				pos += 9
+			}
+			key := []byte{1, 2, 3, 4}
+			copy(frame[pos:], key)
+			pos += 4
+			copy(frame[pos:], payload)
+			testWSSimpleMask(key, frame[pos:])
+			pos += lenPayload
+			toSend := frame[:pos]
+			if _, err := wsc.Write(toSend); err != nil {
+				t.Fatalf("Error sending message: %v", err)
+			}
+
+			// We should have been disconnected.
+			rbuf := make([]byte, 1024)
+			_, err := br.Read(rbuf)
+			require_Error(t, err)
+
+			select {
+			case err := <-l.errCh:
+				if !strings.Contains(err, ErrMaxPayload.Error()) {
+					t.Fatalf("Expected %s error, got %s", ErrMaxPayload, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Did not get the expected error")
+			}
+		})
+	}
+}
+
 // ==================================================================
 // = Benchmark tests
 // ==================================================================

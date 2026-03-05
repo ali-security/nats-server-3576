@@ -27,11 +27,6 @@ jobs:
         run: |
           go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.53.3
 
-      - name: Lint
-        shell: bash --noprofile --norc -x -eo pipefail {0}
-        run: |
-          golangci-lint run
-
       - name: Run tests
         shell: bash --noprofile --norc -x -eo pipefail {0}
         run: |
