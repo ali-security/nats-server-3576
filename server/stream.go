@@ -3061,6 +3061,7 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 
 	s, js, stype := mset.srv, mset.js, mset.cfg.Storage
 	node := mset.node
+	prevFails := mset.mirror.fails
 	mset.mu.Unlock()
 
 	var err error
@@ -3090,19 +3091,37 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 			// We may have missed messages, restart.
 			if sseq <= mset.lastSeq() {
 				mset.mu.Lock()
-				mset.mirror.lag = olag
-				mset.mirror.sseq = osseq
-				mset.mirror.dseq = odseq
+				if mset.mirror != nil {
+					mset.mirror.lag = olag
+					mset.mirror.sseq = osseq
+					mset.mirror.dseq = odseq
+				}
 				mset.mu.Unlock()
 				return false
 			} else {
 				mset.mu.Lock()
-				mset.mirror.dseq = odseq
-				mset.mirror.sseq = osseq
+				if mset.mirror != nil {
+					mset.mirror.dseq = odseq
+					mset.mirror.sseq = osseq
+					// Increment fails, so we delay retrying. If the consumer creation succeeds
+					// immediately, but we can't persist any messages, we should slow down too.
+					mset.mirror.fails++
+				}
 				mset.mu.Unlock()
 				mset.retryMirrorConsumer()
 			}
 		}
+	} else if prevFails > 0 {
+		mset.mu.Lock()
+		if mset.mirror != nil {
+			// Clear on success.
+			if prevFails > mset.mirror.fails {
+				mset.mirror.fails = 0
+			} else {
+				mset.mirror.fails -= prevFails
+			}
+		}
+		mset.mu.Unlock()
 	}
 	return err == nil
 }
@@ -3396,9 +3415,6 @@ func (mset *stream) setupMirrorConsumer() error {
 					// Cancel here since we can not do anything with this consumer at this point.
 					mset.cancelSourceInfo(mset.mirror)
 					mset.scheduleSetupMirrorConsumerRetry()
-				} else {
-					// Clear on success.
-					mset.mirror.fails = 0
 				}
 			}
 			mset.mu.Unlock()
@@ -3764,9 +3780,6 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 					// Cancel here since we can not do anything with this consumer at this point.
 					mset.cancelSourceInfo(si)
 					mset.setupSourceConsumer(iname, seq, startTime)
-				} else {
-					// Clear on success.
-					si.fails = 0
 				}
 			}
 			mset.mu.Unlock()
@@ -4019,6 +4032,7 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 		si.lag = pending - 1
 	}
 	node := mset.node
+	prevFails := si.fails
 	mset.mu.Unlock()
 
 	hdr, msg := m.hdr, m.msg
@@ -4089,12 +4103,24 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 					iNameMap := map[string]struct{}{iName: {}}
 					mset.setStartingSequenceForSources(iNameMap)
 					mset.mu.Lock()
+					// Increment fails, so we delay retrying. If the consumer creation succeeds
+					// immediately, but we can't persist any messages, we should slow down too.
+					si.fails++
 					mset.retrySourceConsumerAtSeq(iName, si.sseq+1)
 					mset.mu.Unlock()
 				}
 			}
 		}
 		return false
+	} else if prevFails > 0 {
+		mset.mu.Lock()
+		// Clear on success.
+		if prevFails > si.fails {
+			si.fails = 0
+		} else {
+			si.fails -= prevFails
+		}
+		mset.mu.Unlock()
 	}
 
 	return true
